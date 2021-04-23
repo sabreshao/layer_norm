@@ -420,9 +420,62 @@ LAYERNORM_LINEAR_IMPL(nv_bfloat16, float, false)
 }  // namespace contrib
 }  // namespace onnxruntime
 
+
+#include <iostream>
+
+// ApplyLayerNorm T 2 U 4 0x7f7c93104500 0x7f7ca7114500 0x7f7ca711c500 0x7f7c92104500 0x7f7fa3ce9200 0x7f7eaffdce00
+// ApplyLayerNorm n1 8192 n2 1024 simplified 0 nshared 24 warp_size 64 block 8192
+// ApplyLayerNorm T 2 U 4 0x7f7ca93c4500 0x7f80d423e200 0x7f80d423f600 0x7f7ca9144500 0x7f7edb06ae00 0x7f7f2876c200
+// ApplyLayerNorm n1 1280 n2 1024 simplified 0 nshared 24 warp_size 64 block 1280
+
 int main()
 {
-    return 0;
-}
+  hipDeviceProp_t devProp;
+  hipGetDeviceProperties(&devProp, 0);
 
+  std::cout << "Device name " << devProp.name << std::endl;
+
+  int errors;
+  int n1 = 8192, n2 = 1024;
+  void *vals = nullptr, *out_vals = nullptr;
+  void *gama = nullptr, *beta = nullptr;
+  void *mean = nullptr, *invvar = nullptr;
+  hipEvent_t start, stop;
+  float time = 0.0f;
+  hipEventCreate(&start);
+  hipEventCreate(&stop);
+  hipMalloc((void**)&vals,     n1 * n2 * sizeof(float));
+  hipMalloc((void**)&out_vals, n1 * n2 * sizeof(float));
+  hipMalloc((void**)&gama,     n2 * sizeof(float));
+  hipMalloc((void**)&beta,     n2 * sizeof(float));
+  hipMalloc((void**)&mean,     n1 * sizeof(float));
+  hipMalloc((void**)&invvar,   n1 * sizeof(float));
+
+  printf("warmp up\n");
+  onnxruntime::contrib::rocm::HostApplyLayerNorm<half, float, false>(devProp, nullptr, (half*)out_vals, (float*)mean, (float*)invvar, (const half*)vals, n1, n2, 0.1, (const half*)gama, (const half*)beta);
+
+  printf("simulate one step seq128 bs64 cuApplyLayerNorm\n");
+  hipEventRecord(start, NULL);
+  for (int i = 0; i < 49; i++)
+  {
+    onnxruntime::contrib::rocm::HostApplyLayerNorm<half, float, false>(devProp, nullptr, (half*)out_vals, (float*)mean, (float*)invvar, (const half*)vals, n1, n2, 0.1, (const half*)gama, (const half*)beta);
+  }
+  onnxruntime::contrib::rocm::HostApplyLayerNorm<half, float, false>(devProp, nullptr, (half*)out_vals, (float*)mean, (float*)invvar, (const half*)vals, 1280, n2, 0.1, (const half*)gama, (const half*)beta);
+  hipEventRecord(stop, NULL);
+  hipEventSynchronize(stop);
+
+  hipEventElapsedTime(&time, start, stop);
+  printf("ApplyNum time %lf\n", time);
+
+  hipFree(vals);
+  hipFree(out_vals);
+  hipFree(gama);
+  hipFree(beta);
+  hipFree(mean);
+  hipFree(invvar);
+  hipEventDestroy(start);
+  hipEventDestroy(stop);
+
+  return 0;
+}
 

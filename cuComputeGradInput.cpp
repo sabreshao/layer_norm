@@ -482,6 +482,7 @@ void HostLayerNormGradient(
   const int warp_size = prop.warpSize;
   //ORT_ENFORCE(warp_size == GPU_WARP_SIZE);
 
+#if 0 // comment out since these kernels are not hotspot
   const dim3 threads2(warp_size, 4, 1);
   const dim3 blocks2((n2 + threads2.x - 1) / threads2.x, part_size, 1);
   const int nshared2_a = 2 * sizeof(U) * threads2.y * threads2.y * (threads2.x + 1);
@@ -525,6 +526,8 @@ void HostLayerNormGradient(
       n1, n2,
       grad_gamma,
       grad_beta);
+#endif
+
   // compute grad_input
   const uint64_t maxGridY = prop.maxGridSize[1];
   const dim3 blocks1(1, std::min<unsigned int>(static_cast<unsigned int>(n1), static_cast<unsigned int>(maxGridY)), 1);
@@ -575,7 +578,63 @@ LAYERNORMGRAD_IMPL(nv_bfloat16, float, false)
 }  // namespace rocm
 }  // namespace onnxruntime
 
+#include <iostream>
+
+// ComputeGradInput n1 1280 n2 1024 part 16 simplified 0 nshared 1024 warp_size 64 blocky 1280 blockz 0
+// ComputeGradInput T 2 U 4 0x7f7ca93c4500 0x7f7ca9144500 (nil) 0x7f7edb06ae00 (nil) 0x7f80d423e200 0x7f80d423f600 0x7f7cb0ff4500
+// ComputeGradInput n1 8192 n2 1024 part 16 simplified 0 nshared 1024 warp_size 64 blocky 8192 blockz 1756198992
+// ComputeGradInput T 2 U 4 0x7f7cb1274500 0x7f7c92104500 (nil) 0x7f7fa3ce9200 (nil) 0x7f7ca7114500 0x7f7ca711c500 0x7f7c93104500
+//
+
 int main()
 {
-    return 0;
+  hipDeviceProp_t devProp;
+  hipGetDeviceProperties(&devProp, 0);
+
+  std::cout << "Device name " << devProp.name << std::endl;
+
+  int errors;
+  int n1 = 8192, n2 = 1024;
+  void *dout = nullptr, *input = nullptr;
+  void *gama = nullptr;
+  void *mean = nullptr, *invvar = nullptr;
+  void *grad_input = nullptr;
+  hipEvent_t start, stop;
+  float time = 0.0f;
+  hipEventCreate(&start);
+  hipEventCreate(&stop);
+  hipMalloc((void**)&dout,     n1 * n2 * sizeof(float));
+  hipMalloc((void**)&input,    n1 * n2 * sizeof(float));
+  hipMalloc((void**)&gama,     n2 * sizeof(float));
+  hipMalloc((void**)&mean,     n1 * sizeof(float));
+  hipMalloc((void**)&invvar,   n1 * sizeof(float));
+  hipMalloc((void**)&grad_input,   n1 *  n2 * sizeof(float));
+
+  printf("warmp up\n");
+  onnxruntime::rocm::HostLayerNormGradient<half, float, false>(devProp, nullptr, (const half*)dout, (const half*)input, nullptr, (const half*)gama, (const half*)nullptr, (const float*)mean, (const float*)invvar, n1, n2, (half*)grad_input, nullptr, nullptr, nullptr, nullptr, 16);
+
+  printf("simulate one step seq128 bs64 cuComputeGradInput\n");
+  hipEventRecord(start, NULL);
+  onnxruntime::rocm::HostLayerNormGradient<half, float, false>(devProp, nullptr, (const half*)dout, (const half*)input, nullptr, (const half*)gama, (const half*)nullptr, (const float*)mean, (const float*)invvar, 1280, n2, (half*)grad_input, nullptr, nullptr, nullptr, nullptr, 16);
+  for (int i = 0; i < 49; i++)
+  {
+    onnxruntime::rocm::HostLayerNormGradient<half, float, false>(devProp, nullptr, (const half*)dout, (const half*)input, nullptr, (const half*)gama, (const half*)nullptr, (const float*)mean, (const float*)invvar, n1, n2, (half*)grad_input, nullptr, nullptr, nullptr, nullptr, 16);
+  }
+
+  hipEventRecord(stop, NULL);
+  hipEventSynchronize(stop);
+
+  hipEventElapsedTime(&time, start, stop);
+  printf("ApplyNum time %lf\n", time);
+
+  hipFree(dout);
+  hipFree(input);
+  hipFree(gama);
+  hipFree(mean);
+  hipFree(invvar);
+  hipFree(grad_input);
+  hipEventDestroy(start);
+  hipEventDestroy(stop);
+
+  return 0;
 }
